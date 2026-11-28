@@ -20,6 +20,12 @@ code=r'''
 #include "kern_alderlake_s.hpp"
 #include "firmware_panel_fixture.hpp"
 bool auditEnabled=false;
+uint32_t panelOverrideArg=UINT32_MAX;
+bool PE_parse_boot_argn(const char *arg,void *out,int len){
+ assert(!strcmp(arg,"wexpaneltype") && len==4);
+ if(panelOverrideArg==UINT32_MAX)return false;
+ *static_cast<uint32_t*>(out)=panelOverrideArg;return true;
+}
 bool checkKernelArgument(const char *arg){assert(!strcmp(arg,"-wex-dsi-audit"));return auditEnabled;}
 #define OSDynamicCast(type,ptr) (ptr)
 constexpr unsigned kIODirectionIn=1,kIOMapReadOnly=2;
