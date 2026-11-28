@@ -12576,6 +12576,24 @@ static void xelpVideoIRQ(void *bridge,uint64_t *events) {
 
 bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
  if(adlnDetected && tglAcceleratorRequested)dsiBackingHooksReady=processDSIBackingHooks(patcher,index,address,size);
+ // -wex-noccs (opt-in, #163): disable Compute Command Streamer (EnableMultiContext=1 in donor
+ // Info.plist) per Intel TGL PRM Vol 14 "SVSM: Dual Context - Invalidate hang". Matched by exact
+ // NUL-terminated key string only if it occurs once in the image.
+ if(checkKernelArgument("-wex-noccs") && currentGraphics) {
+  static const uint8_t f[]="EnableMultiContext",r[]="EnableMultiContexX";
+  uint32_t rec[2] {};
+  auto base=reinterpret_cast<const uint8_t *>(address);
+  const uint8_t *site=nullptr;
+  for(size_t i=0;size>=sizeof(f) && i<=size-sizeof(f);++i)
+   if(base[i]=='E' && !memcmp(base+i,f,sizeof(f))) {++rec[0];site=base+i;}
+  if(rec[0]==1) {
+   KernelPatcher::LookupPatch patch {currentGraphics,f,r,sizeof(f),1};
+   patcher.applyLookupPatch(&patch,const_cast<uint8_t *>(site),sizeof(f)+1);
+   rec[1]=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,r,sizeof(r));
+  }
+  patcher.clearError();
+  IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeNoCCS",rec,sizeof(rec));
+ }
  // Framebuffer-only mode must never enter the donor accelerator probe.
  // The bring-up payload omits this bundle; also reject it if already present.
  if (!tglAcceleratorRequested) {

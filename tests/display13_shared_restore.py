@@ -74,6 +74,7 @@ namespace Display13DC9PwrOff {
 static Display13DC9PwrOff::State display13DC9State;
 struct XE {
  bool display13FBLifecycleHooksReady=true;uintptr_t adlnWorkLoopInGate=0,adlnWorkLoopTryClose=0,adlnWorkLoopOpen=0;
+ struct { bool dsi=false; } adlnOutputWiring;
  bool restoreDisplay13ResourcesLocked(void*,bool);
  bool enableDisplay13EngineLocked(void*) {
   ++enables;auto &c=display13FBPower;assert(c.map->regs[0x42084/4]&(1U<<30));
