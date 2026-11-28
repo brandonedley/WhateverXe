@@ -143,7 +143,7 @@ inline bool samePanelFacts(const Ports::Panel &a,const Ports::Panel &b) {
 }
 // Optional panel facts must never weaken General Definitions admission or
 // make an unrelated malformed firmware tail reject usable connector facts.
-inline void panelFacts(const uint8_t *b,size_t header,size_t size,Ports &ports,const uint8_t *identity,uint16_t handle) {
+inline void panelFacts(const uint8_t *b,size_t header,size_t size,Ports &ports,const uint8_t *identity,uint16_t handle,uint32_t panelOverride=UINT32_MAX) {
     const uint8_t *options=nullptr,*edp=nullptr,*power=nullptr,*backlight=nullptr;
     size_t optionsSize=0,edpSize=0,powerSize=0,backlightSize=0,ptrSize=0,dataSize=0;
     const uint8_t *ptr=nullptr,*data=nullptr;bool identityDuplicate=false;
@@ -181,6 +181,7 @@ inline void panelFacts(const uint8_t *b,size_t header,size_t size,Ports &ports,c
     // the same equivalence rule; UINT32_MAX reports that no index was selected.
     uint16_t candidates=requested<16?uint16_t(1U<<requested):
         identityDuplicate?0:panelMatches(b,ptr,ptrSize,data,dataSize,identity);
+    if(!candidates && requested==0xff && panelOverride<16)candidates=uint16_t(1U<<panelOverride);
     if(!candidates)candidates=0xffff;
     bool found=false;unsigned count=0;
     for(unsigned type=0;type<16;++type)if(candidates&(1U<<type)) {
@@ -214,7 +215,7 @@ inline uint32_t ddi(Family family,uint32_t dvo) {
     }
     return PortCount;
 }
-inline Ports parse(const void *data,size_t length,Family family,const uint8_t *identity=nullptr) {
+inline Ports parse(const void *data,size_t length,Family family,const uint8_t *identity=nullptr,uint32_t panelOverride=UINT32_MAX) {
     Ports r;
     if(!data || !length)return r;
     if(displayAdapter(family)==DisplayAdapter::Unknown){r.status=Status::Platform;return r;}
@@ -269,7 +270,7 @@ inline Ports parse(const void *data,size_t length,Family family,const uint8_t *i
         r.present|=1U<<d;
         if(!q.fixedTMDS())r.ambiguous|=1U<<d;
     }
-    r.status=Status::Valid;panelFacts(b,bh,bs,r,identity,panelHandle);return r;
+    r.status=Status::Valid;panelFacts(b,bh,bs,r,identity,panelHandle,panelOverride);return r;
 }
 // OpRegion acquisition descriptor, kept pure for malformed/overflow testing.
 struct Region {uint64_t address {};uint32_t bytes {},inlineBytes {};bool valid {};};

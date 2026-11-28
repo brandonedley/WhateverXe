@@ -55,5 +55,22 @@ int main(){
   if(ptr)for(unsigned off:{0U,1U,3U,6U,7U,9U,10U,144U}){bad=f;bad.vbt[f.ptr+off]^=1;assert(!parseInput(bad).panel.valid);}
   for(size_t n=0;n<f.vbt.size();++n)assert(!parse(f.vbt.data(),n,Family::AlderLakeP).valid());
  }
+ // Explicit panelOverride resolves unmatched BDB40=0xFF without weakening strict checks.
+ {
+  PanelFixture::Input f(false,false);
+  // Wipe BDB42 PNP entries so EDID matches nothing, like Lenovo ThinkPad VBT v2.51.
+  for(unsigned n=0;n<16;++n)memset(f.vbt.data()+f.data+66*n+56,0xff,10);
+  const auto edid=panelEDID(f.op.data(),f.op.size());
+  assert(!parse(f.vbt.data(),f.vbt.size(),Family::AlderLakeP,edid).panel.valid);
+  assert(!parse(f.vbt.data(),f.vbt.size(),Family::AlderLakeP,edid,16).panel.valid);
+  auto ov=parse(f.vbt.data(),f.vbt.size(),Family::AlderLakeP,edid,0);
+  assert(ov.valid() && ov.panel.valid && ov.panel.type==0 && ov.panel.ddi==0);
+  auto wiring=display13Fixed(ov,0x7b,Family::AlderLakeP);
+  assert(wiring.panel==1 && wiring.hdmi==2 && wiring.ddc[1]==2);
+  // Exact PnP match still wins over panelOverride.
+  PanelFixture::Input matched(false,false);
+  auto m=parse(matched.vbt.data(),matched.vbt.size(),Family::AlderLakeP,panelEDID(matched.op.data(),matched.op.size()),0);
+  assert(m.valid() && m.panel.valid && m.panel.type==9);
+ }
  puts("PASS automatic EDID panel identity, explicit/generated pointers, equivalent facts, duplicate records and PPS/wiring consumers");
 }
