@@ -94,6 +94,7 @@ void endTGLBootMode(void *path) {
 #include "kern_tgl_panel_depth.hpp"
 #include "kern_xelp_panel_power.hpp"
 #include "kern_display13_panel.hpp"
+#include "kern_display13_wake_gate.hpp"
 #include "kern_tgl_pcode_gate.hpp"
 #include "kern_tgl_pcode_edram.hpp"
 #include "kern_tgl_tc_cold.hpp"
@@ -4810,6 +4811,7 @@ struct Display13FBPowerContext {
     bool memoryFaulted {};
     IOWorkLoop *workLoop {}; // Retained, qualified native IRQ source loop.
     uint64_t powerContext[24] {1}; // Bounded CPU-only execution-context evidence.
+    Display13Wake::Stats wakeStats {};
 };
 static Display13FBPowerContext display13FBPower;
 #include "kern_dsi_adapter_state.inc"
@@ -10539,28 +10541,91 @@ void XE::wrapAlderLakeNEngineDisable(void *power) {
     stopDisplay13Engine(power,false);
 }
 
+struct Display13WakeGateOps {
+    IOWorkLoop *loop;
+    mach_vm_address_t inGateFn;
+    mach_vm_address_t tryCloseFn;
+    bool inGate() const { return reinterpret_cast<bool (*)(const IOWorkLoop *)>(inGateFn)(loop); }
+    bool tryCloseGate() const { return reinterpret_cast<bool (*)(IOWorkLoop *)>(tryCloseFn)(loop); }
+    void delayUs(unsigned us) const { IODelay(us); }
+    void sleepMs(unsigned ms) const { IOSleep(ms); }
+};
+
+struct Display13WakeGateGuard {
+    IOWorkLoop *loop {};
+    mach_vm_address_t openFn {};
+    bool acquired {};
+    void release() {
+        if(acquired && loop && openFn) {
+            reinterpret_cast<void (*)(IOWorkLoop *)>(openFn)(loop);
+            acquired=false;
+        }
+        if(loop) {
+            loop->release();
+            loop=nullptr;
+        }
+    }
+    ~Display13WakeGateGuard() { release(); }
+};
+
+static void display13WakeStatsPublishLocked() {
+    const auto &s=display13FBPower.wakeStats;
+    uint32_t rec[12] {
+        s.version, s.wakeCalls, s.gateRetriesTotal, s.gateMaxRetries,
+        s.gateTimeouts, s.barRetriesTotal, s.barTimeouts, s.pg0RetriesTotal,
+        s.pg0Timeouts, s.restoreFailures, s.lastFailureStage, s.lastFailureStatus
+    };
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13WakeGate",rec,sizeof(rec));
+}
+
 void XE::stopDisplay13Engine(void *power,bool systemSuspend) {
 	auto &c=display13FBPower;if(!c.lock || power!=c.power || !c.controller)return;
 	uint64_t record[12] {},hotplug[16] {},irqRelease[12] {};Display13Power::Result released;Display13Clock::Change clock;
-	IOWorkLoop *acquiredGate=nullptr;bool gateAttempted=false,gateReady=false;uint64_t gateEvidence[8] {};
+	Display13WakeGateGuard gateGuard {};bool gateAttempted=false,gateReady=false;uint64_t gateEvidence[8] {};
 	Display13DBUF::Status status=Display13DBUF::Status::Unavailable;IOLockLock(c.lock);
     const bool dual=Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring);
     auto ensureGate=[&]() {
         if(!dual)return true;
         if(gateAttempted)return gateReady;
         gateAttempted=true;gateEvidence[0]=1;
-        const bool bound=c.workLoop && Display13FBMemory::field<IOWorkLoop *>(c.controller,0xE00)==c.workLoop;
+        auto loop=c.workLoop;
+        const bool bound=loop && c.controller && Display13FBMemory::field<IOWorkLoop *>(c.controller,0xE00)==loop;
         const bool api=callbackXE->adlnWorkLoopInGate && callbackXE->adlnWorkLoopTryClose && callbackXE->adlnWorkLoopOpen;
         gateEvidence[1]=bound;gateEvidence[2]=api;
         if(bound && api) {
-            gateEvidence[3]=reinterpret_cast<bool (*)(const IOWorkLoop *)>(callbackXE->adlnWorkLoopInGate)(c.workLoop);
+            gateEvidence[3]=reinterpret_cast<bool (*)(const IOWorkLoop *)>(callbackXE->adlnWorkLoopInGate)(loop);
             if(gateEvidence[3])gateReady=true;
-            else if(reinterpret_cast<bool (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopTryClose)(c.workLoop)) {
-                acquiredGate=c.workLoop;gateEvidence[4]=1;gateReady=true;
+            else if(reinterpret_cast<bool (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopTryClose)(loop)) {
+                gateGuard.release();
+                loop->retain();
+                gateGuard.loop=loop;gateGuard.openFn=callbackXE->adlnWorkLoopOpen;gateGuard.acquired=true;
+                gateEvidence[4]=1;gateReady=true;
             }
         }
         gateEvidence[5]=gateReady;return gateReady;
     };
+    if(dual && callbackXE->display13FBLifecycleHooksReady && power==c.power && c.controller &&
+       c.bridge.begun && !c.bridge.state.faulted && !c.bridge.state.suspended &&
+       c.workLoop && Display13FBMemory::field<IOWorkLoop *>(c.controller,0xE00)==c.workLoop &&
+       callbackXE->adlnWorkLoopInGate && callbackXE->adlnWorkLoopTryClose && callbackXE->adlnWorkLoopOpen &&
+       !reinterpret_cast<bool (*)(const IOWorkLoop *)>(callbackXE->adlnWorkLoopInGate)(c.workLoop)) {
+        auto loop=c.workLoop;
+        loop->retain();
+        IOLockUnlock(c.lock);
+        Display13WakeGateOps gateOps {loop,callbackXE->adlnWorkLoopInGate,callbackXE->adlnWorkLoopTryClose};
+        const auto gateResult=Display13Wake::acquireGate(gateOps);
+        gateGuard.loop=loop;gateGuard.openFn=callbackXE->adlnWorkLoopOpen;gateGuard.acquired=gateResult.acquired;
+        IOLockLock(c.lock);
+        gateAttempted=true;gateEvidence[0]=1;gateEvidence[1]=1;gateEvidence[2]=1;
+        gateEvidence[3]=gateResult.inGate ? 1 : 0;gateEvidence[4]=gateResult.acquired ? 1 : 0;
+        gateReady=gateResult.ok && power==c.power && c.controller && c.workLoop==loop &&
+            Display13FBMemory::field<IOWorkLoop *>(c.controller,0xE00)==loop;
+        gateEvidence[5]=gateReady;
+        if(gateResult.retries) {
+            IOLog("WhateverXe: Display13 stopEngine %s workLoop gate after %u retries\n",
+                gateResult.ok ? "acquired" : "TIMED OUT", gateResult.retries);
+        }
+    }
     // No FB0 lifetime/connection assumption. For dual, keep the native gate
     // across shared STOP and HPD restore; queued SW work runs after our exit.
     auto restoreHPD=[&]() {
@@ -10650,7 +10715,7 @@ void XE::stopDisplay13Engine(void *power,bool systemSuspend) {
 	if(hotplug[0])IORegistryEntry::getRegistryRoot()->setProperty("N97FBHotplugIdle",hotplug,sizeof(hotplug));
 	if(gateEvidence[0])IORegistryEntry::getRegistryRoot()->setProperty("N97FBEngineStopGate",gateEvidence,sizeof(gateEvidence));
 	if(irqRelease[0])IORegistryEntry::getRegistryRoot()->setProperty("N97FBEngineStopIRQ",irqRelease,sizeof(irqRelease));
-	if(acquiredGate)reinterpret_cast<void (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopOpen)(acquiredGate);
+	gateGuard.release();
 }
 
 void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
@@ -10665,8 +10730,30 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	// physical object has simulator=0. Do not force unrelated DDI/AUX domains.
 	if(!enable)stopDisplay13Engine(power,true);
 	uint64_t record[32] {},suspendIRQ[24] {};Display13Power::Result result;
-	IOWorkLoop *acquiredGate=nullptr;IOLockLock(c.lock);
-	if(callbackXE->display13FBLifecycleHooksReady && !enable && c.bridge.begun && !c.bridge.state.faulted &&
+	Display13WakeGateGuard gateGuard {};IOLockLock(c.lock);
+	bool gateAttempted=false;
+	if(callbackXE->display13FBLifecycleHooksReady && !enable && power==c.power && c.controller &&
+	   Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) &&
+	   c.bridge.begun && !c.bridge.state.faulted && !c.bridge.state.suspended &&
+	   !c.engineEnabled && c.clockStopped && !c.dbuf.owned && !Display13WM::busyPipes(c.pipe) &&
+	   c.workLoop && Display13FBMemory::field<IOWorkLoop *>(c.controller,0xE00)==c.workLoop &&
+	   callbackXE->adlnWorkLoopInGate && callbackXE->adlnWorkLoopTryClose && callbackXE->adlnWorkLoopOpen &&
+	   !reinterpret_cast<bool (*)(const IOWorkLoop *)>(callbackXE->adlnWorkLoopInGate)(c.workLoop)) {
+		auto loop=c.workLoop;
+		loop->retain();
+		IOLockUnlock(c.lock);
+		Display13WakeGateOps gateOps {loop,callbackXE->adlnWorkLoopInGate,callbackXE->adlnWorkLoopTryClose};
+		const auto gateResult=Display13Wake::acquireGate(gateOps);
+		gateGuard.loop=loop;gateGuard.openFn=callbackXE->adlnWorkLoopOpen;gateGuard.acquired=gateResult.acquired;
+		gateAttempted=true;
+		IOLockLock(c.lock);
+		if(gateResult.retries) {
+			IOLog("WhateverXe: Display13 powerOverride %s workLoop gate after %u retries\n",
+				gateResult.ok ? "acquired" : "TIMED OUT", gateResult.retries);
+		}
+	}
+	if(callbackXE->display13FBLifecycleHooksReady && !enable && power==c.power && c.controller &&
+		c.bridge.begun && !c.bridge.state.faulted &&
 		!c.engineEnabled && c.clockStopped && !c.dbuf.owned && !Display13WM::busyPipes(c.pipe)) {
 		if(c.bridge.state.suspended)result.status=Display13Power::Status::Complete;
 		else {
@@ -10677,9 +10764,13 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 			if(multi && c.workLoop && Display13FBMemory::field<IOWorkLoop *>(c.controller,0xE00)==c.workLoop &&
 			   callbackXE->adlnWorkLoopInGate && callbackXE->adlnWorkLoopTryClose && callbackXE->adlnWorkLoopOpen) {
 				suspendIRQ[3]=reinterpret_cast<bool (*)(const IOWorkLoop *)>(callbackXE->adlnWorkLoopInGate)(c.workLoop);
+				suspendIRQ[4]=gateGuard.acquired && gateGuard.loop==c.workLoop ? 1 : 0;
 				if(suspendIRQ[3])gated=true;
-				else if(reinterpret_cast<bool (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopTryClose)(c.workLoop)) {
-					acquiredGate=c.workLoop;suspendIRQ[4]=1;gated=true;
+				else if(!gateAttempted && reinterpret_cast<bool (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopTryClose)(c.workLoop)) {
+					gateGuard.release();
+					c.workLoop->retain();
+					gateGuard.loop=c.workLoop;gateGuard.openFn=callbackXE->adlnWorkLoopOpen;gateGuard.acquired=true;
+					suspendIRQ[4]=1;gated=true;
 				}
 			}
 			suspendIRQ[5]=gated;
@@ -10719,7 +10810,7 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	}
 	if(result.status!=Display13Power::Status::Complete && result.writes)adlnFault(c.bridge.state.faulted,__LINE__);
 	display13FBPowerRecord(record,8,enable,result);IOLockUnlock(c.lock);
-	if(acquiredGate)reinterpret_cast<void (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopOpen)(acquiredGate);
+	gateGuard.release();
 	if(suspendIRQ[0])IORegistryEntry::getRegistryRoot()->setProperty("N97FBSuspendIRQ",suspendIRQ,sizeof(suspendIRQ));
 	adlnPublishPowerRecord("N97FBPowerOverride",record);
 }
@@ -10886,32 +10977,179 @@ bool XE::prepareDisplay13Wake(IOService *fb) {
     auto &c=display13FBPower;
     if(!c.lock || !fb || fb->getMetaClass()->getClassSize()<0x4B90)return true;
     auto controller=Display13FBMemory::field<IOService *>(fb,0x1D0);
+    const uint32_t fbIdx=Display13FBMemory::field<uint32_t>(fb,0x1DC);
+    Display13WakeGateGuard gateGuard {};
     IOLockLock(c.lock);
     if(controller!=c.controller || !c.bridge.begun){IOLockUnlock(c.lock);return true;}
-    Display13FBBootIO io{c.map};const auto driver=io.read(Display13Power::Driver);
-    const bool needed=c.restorePending || c.bridge.state.suspended || !(driver&3) ||
+    Display13FBBootIO io{c.map};
+    uint32_t driver=io.read(Display13Power::Driver);
+    bool needed=driver==UINT32_MAX || c.restorePending || c.bridge.state.suspended || !(driver&3) ||
         (c.engineEnabled && !c.clockStopped && !display13RetainedEngine(false));
-    const bool ready=driver!=UINT32_MAX && (!needed || restoreDisplay13ResourcesLocked(c.power,true));
+    bool ready=true;
+    if(needed) {
+        auto loop=c.workLoop;
+        const bool loopValid=loop && Display13FBMemory::field<IOWorkLoop *>(c.controller,0xE00)==loop &&
+            callbackXE->adlnWorkLoopInGate && callbackXE->adlnWorkLoopTryClose && callbackXE->adlnWorkLoopOpen;
+        if(!loopValid) {
+            c.wakeStats.recordRestoreFailure(2,0);
+            display13WakeStatsPublishLocked();
+            IOLockUnlock(c.lock);
+            IOLog("WhateverXe: Display13 prepareWake FB%u FAILED: workLoop unbound\n",fbIdx);
+            return false;
+        }
+        // Retain workLoop and drop c.lock BEFORE bounded gate acquisition to keep
+        // canonical lock order (c.workLoop -> c.lock) and survive concurrent wake work.
+        loop->retain();
+        IOLockUnlock(c.lock);
+        Display13WakeGateOps gateOps {loop,callbackXE->adlnWorkLoopInGate,callbackXE->adlnWorkLoopTryClose};
+        const auto gateResult=Display13Wake::acquireGate(gateOps);
+        gateGuard.loop=loop;
+        gateGuard.openFn=callbackXE->adlnWorkLoopOpen;
+        gateGuard.acquired=gateResult.acquired;
+        IOLockLock(c.lock);
+        c.wakeStats.recordGate(gateResult);
+        if(!gateResult.ok) {
+            c.wakeStats.recordRestoreFailure(2,gateResult.retries);
+            display13WakeStatsPublishLocked();
+            IOLockUnlock(c.lock);
+            IOLog("WhateverXe: Display13 prepareWake FB%u FAILED: workLoop gate timeout after %u retries\n",
+                fbIdx,gateResult.retries);
+            return false;
+        }
+        if(gateResult.retries) {
+            IOLog("WhateverXe: Display13 prepareWake FB%u acquired workLoop gate after %u retries\n",
+                fbIdx,gateResult.retries);
+        }
+        if(controller!=c.controller || !c.bridge.begun) {
+            display13WakeStatsPublishLocked();
+            IOLockUnlock(c.lock);
+            return true;
+        }
+        if(c.workLoop!=loop || Display13FBMemory::field<IOWorkLoop *>(c.controller,0xE00)!=loop || !c.map) {
+            c.wakeStats.recordRestoreFailure(2,2);
+            display13WakeStatsPublishLocked();
+            IOLockUnlock(c.lock);
+            IOLog("WhateverXe: Display13 prepareWake FB%u FAILED: workLoop/map changed during wait\n",fbIdx);
+            return false;
+        }
+        // Check BAR0 readiness without ever calling IOSleep while holding c.lock.
+        Display13FBBootIO wakeIO{c.map};
+        driver=wakeIO.read(Display13Power::Driver);
+        if(driver==UINT32_MAX) {
+            auto barMap=c.map;
+            barMap->retain();
+            IOLockUnlock(c.lock);
+            Display13FBBootIO unlockedIO{barMap};
+            struct BarIO {
+                Display13FBBootIO &inner;
+                uint32_t read(uint32_t r) const { return inner.read(r); }
+                void sleepMs(unsigned ms) const { IOSleep(ms); }
+            } barIO {unlockedIO};
+            const auto barResult=Display13Wake::waitBarReady(barIO,Display13Power::Driver,driver);
+            IOLockLock(c.lock);
+            barMap->release();
+            c.wakeStats.recordBar(barResult);
+            if(!barResult.ok) {
+                c.wakeStats.recordRestoreFailure(3,barResult.retries);
+                display13WakeStatsPublishLocked();
+                IOLockUnlock(c.lock);
+                IOLog("WhateverXe: Display13 prepareWake FB%u FAILED: BAR0 Driver=0xffffffff after %u ms\n",
+                    fbIdx,barResult.retries);
+                return false;
+            }
+            if(barResult.retries) {
+                IOLog("WhateverXe: Display13 prepareWake FB%u BAR0 settled after %u ms (driver=0x%x)\n",
+                    fbIdx,barResult.retries,driver);
+            }
+            if(controller!=c.controller || !c.bridge.begun) {
+                display13WakeStatsPublishLocked();
+                IOLockUnlock(c.lock);
+                return true;
+            }
+            if(c.workLoop!=loop || Display13FBMemory::field<IOWorkLoop *>(c.controller,0xE00)!=loop || !c.map) {
+                c.wakeStats.recordRestoreFailure(2,3);
+                display13WakeStatsPublishLocked();
+                IOLockUnlock(c.lock);
+                return false;
+            }
+        }
+        needed=c.restorePending || c.bridge.state.suspended || !(driver&3) ||
+            (c.engineEnabled && !c.clockStopped && !display13RetainedEngine(false));
+        ready=!needed || restoreDisplay13ResourcesLocked(c.power,true);
+        if(!ready) {
+            c.wakeStats.recordRestoreFailure(4,c.firstFaultLine);
+            IOLog("WhateverXe: Display13 prepareWake FB%u restoreResources FAILED (faulted=%u clkFault=%u dbufFault=%u line=%u)\n",
+                fbIdx,c.bridge.state.faulted?1U:0U,c.clockFaulted?1U:0U,c.dbuf.faulted?1U:0U,c.firstFaultLine);
+        }
+        display13WakeStatsPublishLocked();
+    }
     unsigned ddi=UINT32_MAX;bool connected=false;
     const auto pipe=Display13FBMemory::boundPipe(c.pipe,fb);
     if(ready && pipe<3 && c.pipe[pipe].powerPath.binding.status==TGLFBBinding::Status::Complete) {
         ddi=c.pipe[pipe].powerPath.binding.ddi;
         Display13TC::Port port;
         if(Display13TC::Port::resolve(ddi,port) && c.tcMode[ddi-3].restorePending) {
-            const auto sde=io.read(0xC4000),north=io.read(0x44470);
+            Display13FBBootIO hpdIO{c.map};
+            const auto sde=hpdIO.read(0xC4000),north=hpdIO.read(0x44470);
             connected=sde==UINT32_MAX || north==UINT32_MAX || port.legacyHPD(sde) || port.altHPD(sde,north);
         }
     }
     IOLockUnlock(c.lock);
+    // Release workLoop gate before TC port handshakes (which take c.lock).
+    gateGuard.release();
     // A disconnected peer must reach native probing/teardown, not prevent
     // every other FB from waking. Only this output's live TC link is required.
-    return ready && (!connected || restoreDisplay13Ports(controller,ddi));
+    const bool portsOk=!connected || restoreDisplay13Ports(controller,ddi);
+    if(!ready || !portsOk) {
+        IOLog("WhateverXe: Display13 prepareWake FB%u returning false (ready=%u connected=%u ddi=%u portsOk=%u)\n",
+            fbIdx,ready?1U:0U,connected?1U:0U,ddi,portsOk?1U:0U);
+    }
+    return ready && portsOk;
 }
 
 void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
     auto &c=display13FBPower;if(!c.lock || power!=c.power || !c.controller)return;
-    IOLockLock(c.lock);const bool ready=restoreDisplay13ResourcesLocked(power,waking);
-    auto controller=static_cast<IOService *>(c.controller);IOLockUnlock(c.lock);
+    Display13WakeGateGuard gateGuard {};
+    IOLockLock(c.lock);
+    if(power!=c.power || !c.controller || !c.bridge.begun){IOLockUnlock(c.lock);return;}
+    auto loop=c.workLoop;
+    const bool loopValid=loop && Display13FBMemory::field<IOWorkLoop *>(c.controller,0xE00)==loop &&
+        callbackXE->adlnWorkLoopInGate && callbackXE->adlnWorkLoopTryClose && callbackXE->adlnWorkLoopOpen;
+    if(loopValid) {
+        loop->retain();
+        IOLockUnlock(c.lock);
+        Display13WakeGateOps gateOps {loop,callbackXE->adlnWorkLoopInGate,callbackXE->adlnWorkLoopTryClose};
+        const auto gateResult=Display13Wake::acquireGate(gateOps);
+        gateGuard.loop=loop;
+        gateGuard.openFn=callbackXE->adlnWorkLoopOpen;
+        gateGuard.acquired=gateResult.acquired;
+        IOLockLock(c.lock);
+        c.wakeStats.recordGate(gateResult);
+        if(!gateResult.ok) {
+            c.wakeStats.recordRestoreFailure(2,gateResult.retries);
+            display13WakeStatsPublishLocked();
+            IOLockUnlock(c.lock);
+            IOLog("WhateverXe: Display13 powerRestore(waking=%u) FAILED: workLoop gate timeout after %u retries\n",
+                waking?1U:0U,gateResult.retries);
+            return;
+        }
+        if(gateResult.retries) {
+            IOLog("WhateverXe: Display13 powerRestore(waking=%u) acquired workLoop gate after %u retries\n",
+                waking?1U:0U,gateResult.retries);
+        }
+    }
+    const bool stillValid=power==c.power && c.controller &&
+        (!loopValid || (c.workLoop==loop && Display13FBMemory::field<IOWorkLoop *>(c.controller,0xE00)==loop));
+    const bool ready=stillValid && restoreDisplay13ResourcesLocked(power,waking);
+    if(!ready) {
+        c.wakeStats.recordRestoreFailure(4,c.firstFaultLine);
+        IOLog("WhateverXe: Display13 powerRestore(waking=%u) restoreResources FAILED (stillValid=%u faulted=%u clkFault=%u line=%u)\n",
+            waking?1U:0U,stillValid?1U:0U,c.bridge.state.faulted?1U:0U,c.clockFaulted?1U:0U,c.firstFaultLine);
+    }
+    display13WakeStatsPublishLocked();
+    auto controller=static_cast<IOService *>(c.controller);
+    IOLockUnlock(c.lock);
+    gateGuard.release();
     if(ready)restoreDisplay13Ports(controller);
 }
 
