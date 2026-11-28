@@ -96,6 +96,7 @@ void endTGLBootMode(void *path) {
 #include "kern_xelp_panel_power.hpp"
 #include "kern_display13_panel.hpp"
 #include "kern_display13_dc9_pwroff.hpp"
+#include "kern_display13_edp_link.hpp"
 #include "kern_display13_wake_gate.hpp"
 #include "kern_tgl_pcode_gate.hpp"
 #include "kern_tgl_pcode_edram.hpp"
@@ -7666,21 +7667,80 @@ bool XE::display13AUXReady(void *port,bool command,bool retained) {
  Display13FBPowerIO io {c.map};return c.bridge.beginAUXCommand(io,config[0]);
 }
 
+static Display13EDPLink::State display13EDPLink;
+static Display13EDPLink::Order display13EDPOrder;
+static uint32_t display13EDPLinkConfigs=0,display13EDPLinkLast[3]={UINT32_MAX,0,UINT32_MAX};
+static uint32_t display13EDPOrderLast[3]={0,0,UINT32_MAX};
+static void display13EDPLinkPublish() {
+ const auto &o=display13EDPOrder;
+ uint32_t record[15]={2,display13EDPLink.assrHidden,display13EDPLink.intervalMasked,display13EDPLinkConfigs,
+  display13EDPLinkLast[0],display13EDPLinkLast[1],display13EDPLinkLast[2],display13EDPLink.tps4Hidden,
+  o.holds,o.joined,o.delivered,o.replaced,display13EDPOrderLast[0],display13EDPOrderLast[1],display13EDPOrderLast[2]};
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPLink",record,sizeof(record));
+}
 uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_t length) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
- IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);IOLockUnlock(c.lock);
+ namespace L=Display13EDPLink;
+ IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);
+ const auto first=ready ? Display13FBMemory::field<uint32_t>(port,0x120) : UINT32_MAX;
+ const bool deliver=first<2 && (callbackXE->adlnOutputWiring.panel&(1U<<first)) && L::read(display13EDPOrder)==L::Step::Deliver;
+ uint8_t held=display13EDPOrder.pattern;IOLockUnlock(c.lock);
  if(!ready)return kIOReturnNotReady;
+ if(deliver) {FunctionCast(wrapDisplay13WriteAUX,callbackXE->orgDisplay13WriteAUX)(port,L::TrainingPatternSet,&held,1);display13EDPLinkPublish();}
  const auto r=FunctionCast(wrapDisplay13ReadAUX,callbackXE->orgDisplay13ReadAUX)(port,address,data,length);
- IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
+ IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);
+ const auto ddi=complete ? Display13FBMemory::field<uint32_t>(port,0x120) : UINT32_MAX;
+ const bool panel=ddi<2 && (callbackXE->adlnOutputWiring.panel&(1U<<ddi));IOLockUnlock(c.lock);
+ if(!r && complete && panel) {
+  const auto before=display13EDPLink.assrHidden+display13EDPLink.intervalMasked+display13EDPLink.tps4Hidden;
+  L::view(display13EDPLink,address,static_cast<uint8_t *>(data),length);
+  if(display13EDPLink.assrHidden+display13EDPLink.intervalMasked+display13EDPLink.tps4Hidden!=before)display13EDPLinkPublish();
+ }
  return r ? r : complete ? 0 : kIOReturnNotReady;
 }
 uint32_t XE::wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32_t length) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
- IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);IOLockUnlock(c.lock);
+ namespace L=Display13EDPLink;
+ const auto bytes=static_cast<const uint8_t *>(data);
+ IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);
+ const auto ddi=ready ? Display13FBMemory::field<uint32_t>(port,0x120) : UINT32_MAX;
+ const bool panel=ddi<2 && (callbackXE->adlnOutputWiring.panel&(1U<<ddi));
+ const auto step=panel ? L::write(display13EDPOrder,address,bytes,length) : L::Step::Pass;
+ uint8_t held=display13EDPOrder.pattern;IOLockUnlock(c.lock);
  if(!ready)return kIOReturnNotReady;
- const auto r=FunctionCast(wrapDisplay13WriteAUX,callbackXE->orgDisplay13WriteAUX)(port,address,data,length);
- IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
- return r ? r : complete ? 0 : kIOReturnNotReady;
+ const auto send=[&](uint32_t at,void *buffer,uint32_t count) {
+  return FunctionCast(wrapDisplay13WriteAUX,callbackXE->orgDisplay13WriteAUX)(port,at,buffer,count);
+ };
+ const auto finish=[&](uint32_t r) {
+  IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
+  return r ? r : complete ? 0 : kIOReturnNotReady;
+ };
+ if(step==L::Step::Hold) {display13EDPLinkPublish();return 0;}
+ if(step==L::Step::Deliver) {send(L::TrainingPatternSet,&held,1);display13EDPLinkPublish();}
+ if(step==L::Step::Join) {
+  if(L::clockRecovery(held)) {
+   const auto read=[&](uint32_t reg) {
+    IOLockLock(c.lock);Display13FBPowerIO io{c.map};
+    const auto v=io.readable(reg) ? io.read(reg) : UINT32_MAX;
+    IOLockUnlock(c.lock);return v;
+   };
+   const auto waited=L::waitBufferActive(read,[](uint32_t us){IODelay(us);},ddi);
+   display13EDPOrderLast[0]=waited;if(waited>=L::BufferWaitUs)++display13EDPOrderLast[1];
+  }
+  uint8_t joined[1+L::MaxLanes];const auto count=L::join(held,bytes,length,joined);
+  const auto r=send(L::TrainingPatternSet,joined,count);
+  display13EDPOrderLast[2]=r;display13EDPLinkPublish();
+  return finish(r);
+ }
+ if(panel && L::startsLinkConfig(address,bytes,length)) {
+  uint8_t power=L::PowerD0,coding=L::Coding8b10b;
+  uint32_t powered=kIOReturnNotReady,tries=0;
+  while(tries<3 && (powered=wrapDisplay13WriteAUX(port,L::SetPower,&power,1))) {++tries;IOSleep(1);}
+  const auto coded=wrapDisplay13WriteAUX(port,L::ChannelCoding,&coding,1);
+  ++display13EDPLinkConfigs;display13EDPLinkLast[0]=powered;display13EDPLinkLast[1]=tries;display13EDPLinkLast[2]=coded;
+  display13EDPLinkPublish();
+ }
+ return finish(send(address,data,length));
 }
 uint32_t XE::wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,uint8_t flag) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
