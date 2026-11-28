@@ -476,7 +476,7 @@ void restartPanel(Fixture &f,Map &map,unsigned ddi) {
   assert(XE::wrapDisplay13PortTraining(f.port,nullptr)==kIOReturnNotReady);
   map.regs[0x78004]=0;
   assert(!dscWrites && !trains && c.bootPanelDSCCheckPending);
-  if(stoppedSink==Supported || stoppedSink==AlreadyOff) {
+  if(stoppedSink==Supported) {
    assert(XE::wrapDisplay13PortTraining(f.port,nullptr)==kIOReturnNotReady);
    assert(!dscWrites && !trains && c.bootPanelDSCCheckPending);
    map.regs[0x60404]=map.regs[0x6fa88]=0;

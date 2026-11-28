@@ -7853,38 +7853,44 @@ bool XE::display13BootPanelDSCOff(void *port,unsigned ddi) {
  IOLockLock(c.lock);const auto source=sourceState();IOLockUnlock(c.lock);
  const bool ready=source==SourceState::Stopped;
  bool complete=false;
+ uint8_t revision=0,cap=0,enable=0;
+ bool identified=false,known=false,readEnable=false;
  if(source!=SourceState::Busy) {
-  // An identified non-DSC panel needs no sink write. Retained CMTG alone
+  // An identified non-DSC panel, or a DSC-capable panel whose DPCD 0x160
+  // already reports DSC disabled, needs no sink write. Retained CMTG alone
   // never authorizes a write to a DSC receiver.
-  uint8_t revision=0,cap=0,enable=0;
-  const bool identified=!wrapDisplay13ReadAUX(port,0,&revision,1) && revision>=0x10 && revision!=0xff;
-  const bool known=identified && (revision<0x14 || !wrapDisplay13ReadAUX(port,0x60,&cap,1));
+  identified=!wrapDisplay13ReadAUX(port,0,&revision,1) && revision>=0x10 && revision!=0xff;
+  known=identified && (revision<0x14 || !wrapDisplay13ReadAUX(port,0x60,&cap,1));
   if(known && !(cap&1))complete=true; // Optional register: no read/write on a non-DSC sink.
-  else if(known && ready) {
-   // Native disableDSCEngine can skip the sink or ignore a failed write.
-   // Preserve other DSC_ENABLE bits if the register is now readable.
-   if(!wrapDisplay13ReadAUX(port,0x160,&enable,1)) {
-    complete=!(enable&1);
-    if(!complete) {
-     enable&=~1U;
-     complete=!wrapDisplay13WriteAUX(port,0x160,&enable,1);
-    }
-   } else {
-    // A directly wired panel has no downstream DSC passthrough to preserve.
-    // With no readback, require the AUX write ACK, as native would on stop.
-    uint8_t downstream=0;
-    enable=0;
-    complete=!wrapDisplay13ReadAUX(port,0x005,&downstream,1) && !(downstream&1) &&
-     !wrapDisplay13WriteAUX(port,0x160,&enable,1);
+  else if(known && !wrapDisplay13ReadAUX(port,0x160,&enable,1)) {
+   readEnable=true;
+   complete=!(enable&1);
+   if(!complete && ready) {
+    enable&=~1U;
+    complete=!wrapDisplay13WriteAUX(port,0x160,&enable,1);
    }
+  } else if(known && ready) {
+   // A directly wired panel has no downstream DSC passthrough to preserve.
+   // With no readback, require the AUX write ACK, as native would on stop.
+   uint8_t downstream=0;
+   enable=0;
+   complete=!wrapDisplay13ReadAUX(port,0x005,&downstream,1) && !(downstream&1) &&
+    !wrapDisplay13WriteAUX(port,0x160,&enable,1);
   }
  }
+ uint32_t ctl2=0,cmtg=0;
  IOLockLock(c.lock);
+ {
+  Display13FBSSTIO io{c.map};
+  ctl2=io.read(0x60404+0x1000*pipe);cmtg=io.read(0x6fa88);
+ }
  complete=complete && sourceState()==source;
  if(complete)c.bootPanelDSCCheckPending=false;
  IOLockUnlock(c.lock);
  uint32_t record[]={1,ddi,pipe,ready,complete};
  IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13BootPanelDSCOff",record,sizeof(record));
+ uint32_t diag[]={1,static_cast<uint32_t>(source),ctl2,cmtg,revision,cap,enable,identified,known,readEnable};
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13BootPanelDSCOffDiag",diag,sizeof(diag));
  return complete;
 }
 
